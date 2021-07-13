@@ -1,3 +1,6 @@
+from collections import deque
+
+
 ID_SERVER = 'id_server'
 ID_CLIENT = 'id_client'
 
@@ -43,6 +46,11 @@ class BaseServer(object):
         self._address = None
         self._backlog = None
         self._connections = None
+        self._recv_q = deque()
+
+    def add_recv_q(self, connection_request):
+        # called by runner
+        pass
 
     def listen(self, address, backlog=5):
         assert isinstance(backlog, int)
