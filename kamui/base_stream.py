@@ -1,14 +1,18 @@
 from collections import deque
+from functools import partial
 from uuid import uuid4
 
 
-ID_SERVER = 'id_server'
-ID_SERVER_LISTEN = 'id_server_listen'
-ID_CLIENT = 'id_client'
+ID_SERVER_LISTEN_BACKLOG = 'id_server_listen_backlog'
 ID_CONNECTION = 'id_connection'
+ID_CONN_C2S_CTRL = 'id_conn_c2s_ctrl'
+ID_CONN_C2S_DATA = 'id_conn_c2s_data'
+ID_CONN_S2C_CTRL = 'id_conn_s2c_ctrl'
+ID_CONN_S2C_DATA = 'id_conn_s2c_data'
 
 
 def id_join(*args):
+    args = (str(arg) for arg in args)
     return '/'.join(args)
 
 
@@ -16,14 +20,14 @@ class EAgain(Exception):
     pass
 
 
-class EBlockingOperation(Exception):
+class BlockingOperation(Exception):
 
     def __init__(self, retrying):
-        super(EBlockingOperation, self).__init__()
+        super(BlockingOperation, self).__init__()
         self.retrying = retrying
 
 
-class ERefused(Exception):
+class ConnectionRefused(Exception):
     pass
 
 
@@ -31,6 +35,10 @@ class BaseIO(object):
 
     @classmethod
     def delete(cls, workspace, zone_id):
+        raise NotImplementedError()
+
+    @classmethod
+    def checksum(cls, io_data):
         raise NotImplementedError()
 
     def __init__(self, workspace, zone_id):
@@ -46,15 +54,142 @@ class BaseIO(object):
 
 class BaseConnection(object):
 
-    def __init__(self, magic, on_close):
-        self._magic = magic
-        self._on_close = on_close
+    IO = BaseIO
 
-    def shutdown(self):
+    STAGE_IDLE = 'idle'
+    STAGE_REQUESTING = 'requesting'
+    STAGE_REPLYING = 'replying'
+
+    @classmethod
+    def get_stage(cls, ctrl_data):
+        snd = ctrl_data.get('F_SND')
+        snd_ack = ctrl_data.get('F_SND_ACK')
+        if snd and not snd_ack:
+            return cls.STAGE_REQUESTING
+        elif snd and snd_ack:
+            return cls.STAGE_REPLYING
+        else:
+            return cls.STAGE_IDLE
+
+    @staticmethod
+    def finishing(ctrl_data):
+        return ctrl_data.get('F_FIN') and not ctrl_data.get('F_FIN_ACK')
+
+    def __init__(self, workspace, side, zone_id, on_close=None):
+        assert side in ('client', 'server')
+        self._workspace = workspace
+        self._side = side
+        self._zone_id = zone_id
+        self._on_close = on_close
+        self._recv_buffer = b''
+        self._recv_eof = False
+        self._send_seq = 0
+        self._recv_seq = 0
+
+        if side == 'client':
+            self._recv_ctrl_id = id_join(zone_id, ID_CONN_S2C_CTRL)
+            self._recv_data_id = id_join(zone_id, ID_CONN_S2C_DATA)
+            self._send_ctrl_id = id_join(zone_id, ID_CONN_C2S_CTRL)
+            self._send_data_id = id_join(zone_id, ID_CONN_C2S_DATA)
+        else:
+            self._recv_ctrl_id = id_join(zone_id, ID_CONN_C2S_CTRL)
+            self._recv_data_id = id_join(zone_id, ID_CONN_C2S_DATA)
+            self._send_ctrl_id = id_join(zone_id, ID_CONN_S2C_CTRL)
+            self._send_data_id = id_join(zone_id, ID_CONN_S2C_DATA)
+
+    def recv(self, data_len=0):
+        raise BlockingOperation(partial(
+            self._on_retrying_receiving, data_len))
+
+    def _cut_buffer(self, data_len):
+        if 0 == data_len:
+            tmp = self._recv_buffer
+            self._recv_buffer = b''
+            return tmp
+        tmp = self._recv_buffer[:data_len]
+        self._recv_buffer = self._recv_buffer[data_len:]
+        return tmp
+
+    def _on_retrying_receiving(self, data_len):
+        ctrl_io = self.IO(self._workspace, self._recv_ctrl_id)
+        data_io = self.IO(self._workspace, self._recv_data_id)
+
+        ctrl_data = ctrl_io.read()
+        if ctrl_data is None:
+            raise EAgain('request not found')
+
+        stage = self.get_stage(ctrl_data)
+
+        if stage == self.STAGE_REQUESTING:
+            if ctrl_data.get('SEQ', -7) != self._recv_seq + 1:
+                raise BrokenPipeError('bad request seq')
+            in_data = data_io.read()
+            if self.IO.checksum(in_data) != ctrl_data.get('CHECKSUM'):
+                raise BrokenPipeError('bad request checksum')
+
+            self._recv_buffer += in_data
+            self._recv_seq += 1
+            ctrl_data['F_SND_ACK'] = True
+            ctrl_data['SEQ_ACK'] = self._recv_seq
+            ctrl_io.write(ctrl_data)
+            # REQUESTING -> REPLYING
+            raise EAgain('data received')
+
+        if self.finishing(ctrl_data):
+            self._recv_eof = True
+
+        buf_len = len(self._recv_buffer)
+        if buf_len >= data_len:
+            return self._cut_buffer(data_len)
+        elif self._recv_eof:
+            return self._cut_buffer(buf_len)
+        else:
+            raise EAgain('not enough')
+
+    def sendall(self, data):
+        assert isinstance(data, bytes)
+        raise BlockingOperation(partial(
+            self._on_retrying_sending_all, data))
+
+    def _on_retrying_sending_all(self, data):
+        ctrl_io = self.IO(self._workspace, self._send_ctrl_id)
+        data_io = self.IO(self._workspace, self._send_data_id)
+
+        ctrl_data = ctrl_io.read(create=True)
+        stage = self.get_stage(ctrl_data)
+
+        if self.finishing(ctrl_data):
+            raise BrokenPipeError('sending-pipe closed')
+
+        if stage == self.STAGE_IDLE:
+            data_io.write(data)
+            self._send_seq += 1
+            ctrl_data['F_SND'] = True
+            ctrl_data['SEQ'] = self._send_seq
+            ctrl_data['CHECKSUM'] = self.IO.checksum(data)
+            ctrl_io.write(ctrl_data)
+            # IDLE -> REQUESTING
+            raise EAgain('data sent')
+
+        if stage == self.STAGE_REPLYING:
+            if ctrl_data.get('SEQ_ACK', -7) != self._send_seq:
+                raise BrokenPipeError('bad reply ack')
+            ctrl_data['F_SND'] = False
+            ctrl_data['F_SND_ACK'] = False
+            ctrl_data['SEQ'] = -1
+            ctrl_data['SEQ_ACK'] = -1
+            ctrl_io.write(ctrl_data)
+            # REPLYING -> IDLE
+            raise EAgain('ack got')
+
+        raise EAgain('waiting for rely')
+
+    def shutdown(self, flag):
         pass
 
     def close(self):
-        self._on_close(self)
+        if self._on_close is not None:
+            self._on_close(self)
 
 
 class BaseClient(object):
@@ -65,23 +200,27 @@ class BaseClient(object):
         self._workspace = workspace
 
     def connect(self, address):
-        # TODO: random zone_id
-        zone_id = id_join(ID_SERVER_LISTEN, address)
-        l_io = self.IO(self._workspace, zone_id)
-        l_data = l_io.read()
-        if l_data is None:
-            raise ERefused()
+        request_token = uuid4().hex
+        zone_id = id_join(ID_SERVER_LISTEN_BACKLOG, address, request_token)
+        r_io = self.IO(self._workspace, zone_id)
+        r_data = r_io.read(create=True)
+        if r_data is None:
+            raise ConnectionRefused()
 
-        if l_data.get('F_CONN') and not l_data.get('F_CONN_ACK'):
-            raise EAgain('some client else connecting')
+        r_data['CLIENT_ADDRESS'] = 'reserved'
+        r_io.write(r_data)
 
-        l_data['CLIENT_ID'] = 'todo'
-        l_io.write(l_data)
+        raise BlockingOperation(partial(
+            self._on_retrying_connecting, r_io, address))
 
-        raise EBlockingOperation(self._on_retrying)
-
-    def _on_retrying(self):
-        pass
+    def _on_retrying_connecting(self, r_io, address):
+        r_data = r_io.read()
+        if r_data.get('F_CONN') and r_data.get('F_CONN_ACK'):
+            conn_num = r_data['CONN_NUM']
+            zone_id = id_join(ID_CONNECTION, address, conn_num)
+            return BaseConnection(self._workspace, 'client', zone_id)
+        else:
+            raise EAgain('waiting for server accepting')
 
 
 class BaseServer(object):
@@ -113,33 +252,43 @@ class BaseServer(object):
     def accept(self):
         assert self._address is not None
 
-        if len(self._connections) >= self._backlog:
+        zone_id = id_join(ID_SERVER_LISTEN_BACKLOG, self._address)
+        b_io = self.IO(self._workspace, zone_id)
+        b_data = b_io.read(create=True)
+        if b_data.get('PENDING', 0) >= self._backlog:
             raise EAgain('backlog busy')
 
-        # TODO: random zone_id
-        zone_id = id_join(ID_SERVER_LISTEN, self._address)
+        request_tokens = b_data.get('REQUEST_TOKENS')
+        for token in request_tokens:
+            try:
+                conn = self._accept_one(token)
+            except EAgain:
+                continue
+            else:
+                return conn
+
+        raise EAgain('no requests at present.')
+
+    def _accept_one(self, request_token):
+        zone_id = id_join(ID_SERVER_LISTEN_BACKLOG, self._address, request_token)
         l_io = self.IO(self._workspace, zone_id)
-        l_data = l_io.read(create=True)
-
-        if not l_data.get('F_CONN'):
+        l_data = l_io.read()
+        if l_data is None or not l_data.get('F_CONN'):
+            self.IO.delete(self._workspace, zone_id)
             raise EAgain('F_CONN false')
-
-        server_magic = uuid4().hex
-        client_magic = uuid4().hex
 
         conn_num = self._pick_conn_num()
         zone_id = id_join(ID_CONNECTION, self._address, conn_num)
         c_io = self.IO(self._workspace, zone_id)
         c_data = c_io.read(create=True)
-        c_data['SERVER_MAGIC'] = server_magic
-        c_data['CLIENT_MAGIC'] = client_magic
+        c_data['SERVER_ADDRESS'] = self._address
         c_io.write(c_data)
 
         l_data['F_CONN_ACK'] = True
         l_data['CONN_NUM'] = conn_num
         l_io.write(l_data)
 
-        conn = BaseConnection(server_magic, self._close_cb)
+        conn = BaseConnection(self._workspace, 'server', zone_id, self._close_cb)
         self._connections.append(conn)
         return conn
 
