@@ -1,6 +1,11 @@
-from collections import deque
 from functools import partial
+from socket import (
+    SHUT_RD,
+    SHUT_RDWR,
+    SHUT_WR,
+)
 from uuid import uuid4
+from zlib import crc32
 
 
 ID_SERVER_LISTEN_BACKLOG = 'id_server_listen_backlog'
@@ -14,6 +19,26 @@ ID_CONN_S2C_DATA = 'id_conn_s2c_data'
 def id_join(*args):
     args = (str(arg) for arg in args)
     return '/'.join(args)
+
+
+def id_head(zone_id):
+    return zone_id.split('/')[0]
+
+
+def id_split(zone_id):
+    return zone_id.split('/')
+
+
+def id_segments(zone_id):
+    return len(id_split(zone_id))
+
+
+def make_request_token():
+    return 'req-' + uuid4().hex
+
+
+def is_request_token(raw):
+    return raw.startswith('req-')
 
 
 class EAgain(Exception):
@@ -39,7 +64,7 @@ class BaseIO(object):
 
     @classmethod
     def checksum(cls, io_data):
-        raise NotImplementedError()
+        return hex(crc32(io_data)).replace('0x', '')
 
     def __init__(self, workspace, zone_id):
         self._workspace = workspace
@@ -120,7 +145,7 @@ class BaseConnection(object):
 
         stage = self.get_stage(ctrl_data)
 
-        if stage == self.STAGE_REQUESTING:
+        if not self._recv_eof and stage == self.STAGE_REQUESTING:
             if ctrl_data.get('SEQ', -7) != self._recv_seq + 1:
                 raise BrokenPipeError('bad request seq')
             in_data = data_io.read()
@@ -185,9 +210,18 @@ class BaseConnection(object):
         raise EAgain('waiting for rely')
 
     def shutdown(self, flag):
-        pass
+        assert flag in (SHUT_RD, SHUT_WR, SHUT_RDWR)
+        if flag == SHUT_RD:
+            # Do nothing.
+            pass
+        else:
+            ctrl_io = self.IO(self._workspace, self._send_ctrl_id)
+            ctrl_data = ctrl_io.read(create=True)
+            ctrl_data['F_FIN'] = True
+            ctrl_io.write(ctrl_data)
 
     def close(self):
+        self.shutdown(SHUT_RDWR)
         if self._on_close is not None:
             self._on_close(self)
 
@@ -200,7 +234,7 @@ class BaseClient(object):
         self._workspace = workspace
 
     def connect(self, address):
-        request_token = uuid4().hex
+        request_token = make_request_token()
         zone_id = id_join(ID_SERVER_LISTEN_BACKLOG, address, request_token)
         r_io = self.IO(self._workspace, zone_id)
         r_data = r_io.read(create=True)
@@ -232,7 +266,6 @@ class BaseServer(object):
         self._address = None
         self._backlog = None
         self._connections = None
-        self._recv_q = deque()
         self._conn_nums = set()
 
     def _pick_conn_num(self):
@@ -258,7 +291,7 @@ class BaseServer(object):
         if b_data.get('PENDING', 0) >= self._backlog:
             raise EAgain('backlog busy')
 
-        request_tokens = b_data.get('REQUEST_TOKENS')
+        request_tokens = b_data.get('REQUEST_TOKENS', [])
         for token in request_tokens:
             try:
                 conn = self._accept_one(token)
