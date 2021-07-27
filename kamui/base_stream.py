@@ -58,6 +58,12 @@ class ConnectionRefused(Exception):
 
 class BaseIO(object):
 
+    # TODO: move to an individual base_io.py
+
+    @classmethod
+    def set_iops(cls, iops):
+        raise NotImplementedError()
+
     @classmethod
     def delete(cls, workspace, zone_id):
         raise NotImplementedError()
@@ -75,6 +81,9 @@ class BaseIO(object):
 
     def read(self, create=False):
         raise NotImplementedError()
+
+    def delete_self(self):
+        return self.delete(self._workspace, self._zone_id)
 
 
 class BaseConnection(object):
@@ -108,8 +117,9 @@ class BaseConnection(object):
         self._on_close = on_close
         self._recv_buffer = b''
         self._recv_eof = False
-        self._send_seq = 0
+        self._send_eof = False
         self._recv_seq = 0
+        self._send_seq = 0
 
         if side == 'client':
             self._recv_ctrl_id = id_join(zone_id, ID_CONN_S2C_CTRL)
@@ -219,11 +229,15 @@ class BaseConnection(object):
             ctrl_data = ctrl_io.read(create=True)
             ctrl_data['F_FIN'] = True
             ctrl_io.write(ctrl_data)
+            self._send_eof = True
 
     def close(self):
-        self.shutdown(SHUT_RDWR)
+        # TODO: mark connection file as reusable
+        if not self._send_eof:
+            self.shutdown(SHUT_RDWR)
         if self._on_close is not None:
             self._on_close(self)
+            self._on_close = None
 
 
 class BaseClient(object):
@@ -252,6 +266,7 @@ class BaseClient(object):
         if r_data.get('F_CONN') and r_data.get('F_CONN_ACK'):
             conn_num = r_data['CONN_NUM']
             zone_id = id_join(ID_CONNECTION, address, conn_num)
+            r_io.delete_self()
             return BaseConnection(self._workspace, 'client', zone_id)
         else:
             raise EAgain('waiting for server accepting')
@@ -266,12 +281,12 @@ class BaseServer(object):
         self._address = None
         self._backlog = None
         self._connections = None
-        self._conn_nums = set()
+        self._conn_nums = [False] * 1000
 
     def _pick_conn_num(self):
-        for num in range(1000):
-            if num not in self._conn_nums:
-                self._conn_nums.add(num)
+        for num in range(len(self._conn_nums)):
+            if not self._conn_nums[num]:
+                self._conn_nums[num] = True
                 return num
         raise EAgain('connection numbers full')
 
@@ -321,9 +336,11 @@ class BaseServer(object):
         l_data['CONN_NUM'] = conn_num
         l_io.write(l_data)
 
-        conn = BaseConnection(self._workspace, 'server', zone_id, self._close_cb)
+        conn = BaseConnection(self._workspace, 'server', zone_id,
+                              partial(self._close_cb, conn_num))
         self._connections.append(conn)
         return conn
 
-    def _close_cb(self, conn):
+    def _close_cb(self, conn_num, conn):
+        self._conn_nums[conn_num] = False
         self._connections.remove(conn)
