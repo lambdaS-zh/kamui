@@ -31,7 +31,7 @@ def run_server():
     pr = FsTcpTunnelServerWorkspaceProcess({
         'iops':                     5,
         'proxy_address':            'test.com',
-        'target_address':           ('sipv4.com', 80),
+        'target_address':           ('127.0.0.1', 8090),
         'time_slice_interval':      10,
         'workspace':                './_workspace',
     })

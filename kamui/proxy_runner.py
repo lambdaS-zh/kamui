@@ -23,6 +23,10 @@ from kamui.base_stream import (
     BlockingOperation,
     EAgain,
 )
+from kamui.logging import get_logger
+
+
+LOG = get_logger(__name__)
 
 
 ClientWorkspaceConfig = namedtuple('ClientWorkspaceConfig', (
@@ -61,18 +65,36 @@ class ProxyThread(Thread):
         self._conn_in = conn_in
         self._conn_out = conn_out
 
+    @staticmethod
+    def long_op(func, *args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except BlockingOperation as ex:
+            retring = ex.retrying
+            while True:
+                try:
+                    return retring()
+                except EAgain:
+                    # TODO: set timeout and customized interval
+                    sleep(0.01)
+                    continue
+
     def run(self):
-        while True:
-            data = self._conn_in.recv()
-            if not data:
-                # read EOF
-                self._conn_out.shutdown(SHUT_WR)
-                self._q.put(1, block=False)
-                break
-            self._conn_out.sendall(data)
-        if self._q.full():
-            self._conn_out.close()
-            self._conn_in.close()
+        try:
+            while True:
+                data = self.long_op(self._conn_in.recv, 4096)
+                if not data:
+                    # read EOF
+                    self._conn_out.shutdown(SHUT_WR)
+                    break
+                self.long_op(self._conn_out.sendall, data)
+        except ConnectionAbortedError:
+            LOG.error('connection aborted by accident.')
+        finally:
+            self._q.put(1, block=False)
+            if self._q.full():
+                self._conn_out.close()
+                self._conn_in.close()
 
 
 class ClientWorkspaceProcess(Process):
@@ -130,10 +152,14 @@ class ClientWorkspaceProcess(Process):
             return conn
 
     def run(self):
+        LOG.info('--- client running ---')
+        LOG.info('config: ' + str(self._config))
         self.PROXY_CLIENT.IO.set_iops(self._config.iops)
         with create_server(self._config.listen_address) as in_tcp:
             while True:
                 conn_tcp, addr_tcp = in_tcp.accept()
+                LOG.debug('received a tcp connection on %s, forwarding to proxy %s' %
+                          (self._config.listen_address, self._config.proxy_address))
                 conn_proxy = self._proxy_connect()
                 q_ = Queue(2)
                 c2s_thr = ProxyThread(q_, conn_tcp, conn_proxy)
@@ -189,11 +215,15 @@ class ServerWorkspaceProcess(Process):
                 continue
 
     def run(self):
+        LOG.info('--- server running ---')
+        LOG.info('config: ' + str(self._config))
         self.PROXY_SERVER.IO.set_iops(self._config.iops)
         proxy_server = self.PROXY_SERVER(self._config.workspace)
         proxy_server.listen(self._config.proxy_address)
         while True:
             conn_proxy = self._proxy_accept(proxy_server)
+            LOG.debug('received a proxy connection on %s, forwarding to tcp %s' %
+                      (self._config.proxy_address, self._config.target_address))
             conn_tcp = create_connection(self._config.target_address)
             q_ = Queue(2)
             c2s_thr = ProxyThread(q_, conn_proxy, conn_tcp)

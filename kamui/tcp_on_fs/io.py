@@ -143,9 +143,12 @@ class _ConnectionIO(object):
     def __init__(self, workspace, zone_id):
         self._workspace = workspace
         self._zone_id = zone_id
+        if ID_CONN_C2S_DATA in zone_id or ID_CONN_S2C_DATA in zone_id:
+            self._bin_data = True
+        else:
+            self._bin_data = False
 
-    def write(self, data):
-        # TODO: open with binary mode when file is type of data
+    def write_ctrl(self, data):
         t_dir = self.target_dir(self._workspace, self._zone_id)
         if not isdir(t_dir):
             makedirs(t_dir)
@@ -155,8 +158,7 @@ class _ConnectionIO(object):
             content = json.dumps(data)
             fd.write(content)
 
-    def read(self, create):
-        # TODO: open with binary mode when file is type of data
+    def read_ctrl(self, create):
         t_dir = self.target_dir(self._workspace, self._zone_id)
         if not isdir(t_dir) and create:
             makedirs(t_dir)
@@ -174,6 +176,46 @@ class _ConnectionIO(object):
         except ValueError:
             raise EAgain('someone may be writing this zone.')
 
+    def write_data(self, data):
+        assert isinstance(data, bytes)
+        t_dir = self.target_dir(self._workspace, self._zone_id)
+        if not isdir(t_dir):
+            makedirs(t_dir)
+
+        t_file = self.target_file(self._workspace, self._zone_id)
+        with open(t_file, 'wb') as fd:
+            fd.write(data)
+
+    def read_data(self, create):
+        t_dir = self.target_dir(self._workspace, self._zone_id)
+        if not isdir(t_dir) and create:
+            makedirs(t_dir)
+
+        t_file = self.target_file(self._workspace, self._zone_id)
+        if not isfile(t_file) and create:
+            with open(t_file, 'wb') as fd:
+                fd.write(b'')
+
+        try:
+            with open(t_file, 'rb') as fd:
+                return fd.read()
+        except OSError:
+            return None
+        except ValueError:
+            raise EAgain('someone may be writing this zone.')
+
+    def write(self, data):
+        if self._bin_data:
+            return self.write_data(data)
+        else:
+            return self.write_ctrl(data)
+
+    def read(self, create):
+        if self._bin_data:
+            return self.read_data(create)
+        else:
+            return self.read_ctrl(create)
+
 
 class FsTcpTunnelIO(BaseIO):
 
@@ -182,13 +224,13 @@ class FsTcpTunnelIO(BaseIO):
         ID_CONNECTION:              _ConnectionIO,
     }
 
-    _IO_INTERVAL_MSEC = 333  # INTERVAL * IOPS = 1000ms
-    _LAST_IO_TIMESTAMP = 0
-    _SEMA = Semaphore(1)
+    _io_interval_msec = 333  # INTERVAL * IOPS = 1000ms
+    _last_io_timestamp = 0
+    _sema = Semaphore(1)
 
     @classmethod
     def set_iops(cls, iops):
-        cls._IO_INTERVAL_MSEC = 1000 / iops
+        cls._io_interval_msec = 1000 / iops
 
     @classmethod
     def route(cls, zone_id):
@@ -199,26 +241,32 @@ class FsTcpTunnelIO(BaseIO):
 
     @classmethod
     def delete(cls, workspace, zone_id):
-        return cls.route(zone_id).delete(workspace, zone_id)
+        # return cls.route(zone_id).delete(workspace, zone_id)
+        return cls._atomic(cls.route(zone_id).delete, workspace, zone_id)
 
     def __init__(self, workspace, zone_id):
         super(FsTcpTunnelIO, self).__init__(workspace, zone_id)
         real_type = self.route(zone_id)
         self._real_io = real_type(workspace, zone_id)
 
-    def _atomic(self, func, *args, **kwargs):
-        self._SEMA.acquire()
+    @classmethod
+    def _atomic(cls, func, *args, **kwargs):
+        cls._sema.acquire(timeout=10)  # FIXME
         try:
-            now = self.now()
-            age = now - self._LAST_IO_TIMESTAMP
-            if age < self._IO_INTERVAL_MSEC:
-                self.sleep(self._IO_INTERVAL_MSEC - age)
+            now = cls.now()
+            age = now - cls._last_io_timestamp
+            if age < cls._io_interval_msec:
+                cls.sleep(cls._io_interval_msec - age)
             try:
                 return func(*args, **kwargs)
             finally:
-                self._LAST_IO_TIMESTAMP = now
+                cls._last_io_timestamp = now
+        except OSError:
+            # On windows, it may cause PermissionError if
+            # someone else opened the same file.
+            raise EAgain('resource temporarily unavailable.')
         finally:
-            self._SEMA.release()
+            cls._sema.release()
 
     def write(self, data):
         return self._atomic(self._real_io.write, data)
