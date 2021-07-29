@@ -59,10 +59,12 @@ class _ServerListenBacklogIO(object):
     def delete(cls, workspace, zone_id):
         if cls.is_list(zone_id):
             t_dir = cls.target_dir(workspace, zone_id)
-            rmtree(t_dir)
+            if isdir(t_dir):
+                rmtree(t_dir)
         else:
             t_file = cls.target_request_file(workspace, zone_id)
-            remove_file(t_file)
+            if isfile(t_file):
+                remove_file(t_file)
 
     def __init__(self, workspace, zone_id):
         self._workspace = workspace
@@ -138,7 +140,9 @@ class _ConnectionIO(object):
 
     @classmethod
     def delete(cls, workspace, zone_id):
-        raise NotImplementedError()
+        t_file = cls.target_file(workspace, zone_id)
+        if isfile(t_file):
+            remove_file(t_file)
 
     def __init__(self, workspace, zone_id):
         self._workspace = workspace
@@ -224,7 +228,7 @@ class FsTcpTunnelIO(BaseIO):
         ID_CONNECTION:              _ConnectionIO,
     }
 
-    _io_interval_msec = 333  # INTERVAL * IOPS = 1000ms
+    _io_interval_msec = 100  # INTERVAL * IOPS = 1000ms
     _last_io_timestamp = 0
     _sema = Semaphore(1)
 

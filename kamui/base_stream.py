@@ -93,24 +93,41 @@ class BaseIO(object):
 
 class _Connection(object):
 
-    STAGE_IDLE = 'idle'
-    STAGE_REQUESTING = 'requesting'
-    STAGE_REPLYING = 'replying'
+    # stage for data transforming
+    SND_STAGE_IDLE = 'snd_stage_idle'
+    SND_STAGE_REQUESTING = 'snd_stage_requesting'
+    SND_STAGE_REPLYING = 'snd_stage_replying'
+
+    # stage for shutting-down
+    FIN_STAGE_IDLE = 'fin_idle'
+    FIN_STAGE_REQUESTING = 'fin_stage_requesting'
+    FIN_STAGE_REPLYING = 'fin_stage_replying'
 
     @classmethod
-    def get_stage(cls, ctrl_data):
+    def get_snd_stage(cls, ctrl_data):
         snd = ctrl_data.get('F_SND')
         snd_ack = ctrl_data.get('F_SND_ACK')
         if snd and not snd_ack:
-            return cls.STAGE_REQUESTING
+            return cls.SND_STAGE_REQUESTING
         elif snd and snd_ack:
-            return cls.STAGE_REPLYING
+            return cls.SND_STAGE_REPLYING
         else:
-            return cls.STAGE_IDLE
+            return cls.SND_STAGE_IDLE
 
-    @staticmethod
-    def finishing(ctrl_data):
-        return ctrl_data.get('F_FIN') and not ctrl_data.get('F_FIN_ACK')
+    @classmethod
+    def get_fin_stage(cls, ctrl_data):
+        fin = ctrl_data.get('F_FIN')
+        fin_ack = ctrl_data.get('F_FIN_ACK')
+        if fin and not fin_ack:
+            return cls.FIN_STAGE_REQUESTING
+        elif fin and fin_ack:
+            return cls.FIN_STAGE_REPLYING
+        else:
+            return cls.FIN_STAGE_IDLE
+
+    @classmethod
+    def finishing(cls, ctrl_data):
+        return cls.get_fin_stage(ctrl_data) == cls.FIN_STAGE_REQUESTING
 
     def __init__(self, io_type, workspace, side, zone_id, on_close=None):
         assert side in ('client', 'server')
@@ -154,12 +171,18 @@ class _Connection(object):
         data_io = self._io_t(self._workspace, self._recv_data_id)
 
         ctrl_data = ctrl_io.read()
-        if ctrl_data is None:
+        if ctrl_data is None or not ctrl_data:
             raise EAgain('request not found')
 
-        stage = self.get_stage(ctrl_data)
+        snd_stage = self.get_snd_stage(ctrl_data)
+        finishing = self.finishing(ctrl_data)
+        if not finishing:
+            if snd_stage == self.SND_STAGE_IDLE:
+                raise EAgain('request not found')
+            elif snd_stage == self.SND_STAGE_REPLYING:
+                raise EAgain('replying')
 
-        if not self._recv_eof and stage == self.STAGE_REQUESTING:
+        if snd_stage == self.SND_STAGE_REQUESTING:
             if ctrl_data.get('SEQ', -7) != self._recv_seq + 1:
                 raise BrokenPipeError('bad request seq')
             in_data = data_io.read()
@@ -173,8 +196,10 @@ class _Connection(object):
             ctrl_io.write(ctrl_data)
             # REQUESTING -> REPLYING
 
-        if self.finishing(ctrl_data):
+        if finishing:
             self._recv_eof = True
+            ctrl_data['F_FIN_ACK'] = True
+            ctrl_io.write(ctrl_data)
 
         buf_len = len(self._recv_buffer)
         if buf_len >= data_len:
@@ -192,12 +217,12 @@ class _Connection(object):
         data_io = self._io_t(self._workspace, self._send_data_id)
 
         ctrl_data = ctrl_io.read(create=True)
-        stage = self.get_stage(ctrl_data)
+        snd_stage = self.get_snd_stage(ctrl_data)
 
         if self.finishing(ctrl_data):
             raise BrokenPipeError('sending-pipe closed')
 
-        if stage == self.STAGE_IDLE:
+        if snd_stage == self.SND_STAGE_IDLE:
             data_io.write(data)
             self._send_seq += 1
             ctrl_data['F_SND'] = True
@@ -208,7 +233,7 @@ class _Connection(object):
             # IDLE -> REQUESTING
             raise EAgain('data sent')
 
-        if stage == self.STAGE_REPLYING:
+        if snd_stage == self.SND_STAGE_REPLYING:
             if ctrl_data.get('SEQ_ACK', -7) != self._send_seq:
                 raise BrokenPipeError('bad reply ack')
             ctrl_data['F_SND'] = False
@@ -222,24 +247,47 @@ class _Connection(object):
         raise EAgain('waiting for rely')
 
     def shutdown(self, flag):
+        # This must be in the thread where sendall is called.
+        # That means, these two methods can't be called at the same time.
         assert flag in (SHUT_RD, SHUT_WR, SHUT_RDWR)
         if flag == SHUT_RD:
             # Do nothing.
             pass
         else:
-            ctrl_io = self._io_t(self._workspace, self._send_ctrl_id)
-            ctrl_data = ctrl_io.read(create=True)
+            raise BlockingOperation(self._on_retrying_shutting_down_wr)
+
+    def _on_retrying_shutting_down_wr(self):
+        ctrl_io = self._io_t(self._workspace, self._send_ctrl_id)
+        ctrl_data = ctrl_io.read(create=True)
+
+        snd_stage = self.get_snd_stage(ctrl_data)
+        if snd_stage != self.SND_STAGE_IDLE:
+            raise EAgain('waiting for data transferring complete')
+
+        fin_stage = self.get_fin_stage(ctrl_data)
+        if fin_stage == self.FIN_STAGE_IDLE:
             ctrl_data['F_FIN'] = True
             ctrl_io.write(ctrl_data)
             self._send_eof = True
+            # IDLE -> REQUESTING
+            raise EAgain('fin sent')
+
+        if fin_stage == self.FIN_STAGE_REPLYING:
+            # REPLYING -> IDLE
+            # FIN-ACK received, now the io can be deleted safely.
+            ctrl_io.delete_self()
+            data_io = self._io_t(self._workspace, self._send_data_id)
+            data_io.delete_self()
+            return
+
+        raise EAgain('waiting for fin-ack')
 
     def close(self):
-        # TODO: mark connection file as reusable
-        if not self._send_eof:
-            self.shutdown(SHUT_RDWR)
         if self._on_close is not None:
             self._on_close(self)
             self._on_close = None
+        if not self._send_eof:
+            self.shutdown(SHUT_RDWR)
 
 
 class BaseClient(object):
@@ -265,11 +313,12 @@ class BaseClient(object):
 
     def _on_retrying_connecting(self, r_io, address):
         r_data = r_io.read()
-        if r_data is None:
-            r_data = {}
-            r_data['CLIENT_ADDRESS'] = 'reserved'
-            r_data['F_CONN'] = True
-            r_data['F_CONN_ACK'] = False
+        if r_data is None or not r_data:
+            r_data = {
+                'CLIENT_ADDRESS':       'reserved',
+                'F_CONN':               True,
+                'F_CONN_ACK':           False,
+            }
             r_io.write(r_data)
             raise EAgain('waiting for server accepting')
 

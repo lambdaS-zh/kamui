@@ -59,10 +59,12 @@ def _check_proxy_address(address):
 
 class ProxyThread(Thread):
 
-    def __init__(self, q_, conn_in, conn_out, *args, **kwargs):
+    def __init__(self, q_, addr_in, conn_in, addr_out, conn_out, *args, **kwargs):
         super(ProxyThread, self).__init__(*args, **kwargs)
         self._q = q_  # type: Queue
+        self._addr_in = addr_in
         self._conn_in = conn_in
+        self._addr_out = addr_out
         self._conn_out = conn_out
 
     @staticmethod
@@ -85,7 +87,8 @@ class ProxyThread(Thread):
                 data = self.long_op(self._conn_in.recv, 4096)
                 if not data:
                     # read EOF
-                    self._conn_out.shutdown(SHUT_WR)
+                    LOG.debug('%s -> %s: EOF' % (self._addr_in, self._addr_out))
+                    self.long_op(self._conn_out.shutdown, SHUT_WR)
                     break
                 self.long_op(self._conn_out.sendall, data)
         except ConnectionAbortedError:
@@ -93,8 +96,9 @@ class ProxyThread(Thread):
         finally:
             self._q.put(1, block=False)
             if self._q.full():
-                self._conn_out.close()
-                self._conn_in.close()
+                LOG.debug('tunnel [%s -- %s] closed' % (self._addr_in, self._addr_out))
+                self.long_op(self._conn_out.close)
+                self.long_op(self._conn_in.close)
 
 
 class ClientWorkspaceProcess(Process):
@@ -155,15 +159,18 @@ class ClientWorkspaceProcess(Process):
         LOG.info('--- client running ---')
         LOG.info('config: ' + str(self._config))
         self.PROXY_CLIENT.IO.set_iops(self._config.iops)
-        with create_server(self._config.listen_address) as in_tcp:
+
+        la = self._config.listen_address
+        pa = self._config.proxy_address
+
+        with create_server(la) as in_tcp:
             while True:
                 conn_tcp, addr_tcp = in_tcp.accept()
-                LOG.debug('received a tcp connection on %s, forwarding to proxy %s' %
-                          (self._config.listen_address, self._config.proxy_address))
+                LOG.info('received a tcp connection on %s, forwarding to proxy %s' % (la, pa))
                 conn_proxy = self._proxy_connect()
                 q_ = Queue(2)
-                c2s_thr = ProxyThread(q_, conn_tcp, conn_proxy)
-                s2c_thr = ProxyThread(q_, conn_proxy, conn_tcp)
+                c2s_thr = ProxyThread(q_, la, conn_tcp, pa, conn_proxy)
+                s2c_thr = ProxyThread(q_, pa, conn_proxy, la, conn_tcp)
                 c2s_thr.setDaemon(True)
                 s2c_thr.setDaemon(True)
                 c2s_thr.start()
@@ -218,16 +225,20 @@ class ServerWorkspaceProcess(Process):
         LOG.info('--- server running ---')
         LOG.info('config: ' + str(self._config))
         self.PROXY_SERVER.IO.set_iops(self._config.iops)
+
+        pa = self._config.proxy_address
+        ta = self._config.target_address
+
         proxy_server = self.PROXY_SERVER(self._config.workspace)
-        proxy_server.listen(self._config.proxy_address)
+        proxy_server.listen(pa)
+
         while True:
             conn_proxy = self._proxy_accept(proxy_server)
-            LOG.debug('received a proxy connection on %s, forwarding to tcp %s' %
-                      (self._config.proxy_address, self._config.target_address))
-            conn_tcp = create_connection(self._config.target_address)
+            LOG.info('received a proxy connection on %s, forwarding to tcp %s' % (pa, ta))
+            conn_tcp = create_connection(ta)
             q_ = Queue(2)
-            c2s_thr = ProxyThread(q_, conn_proxy, conn_tcp)
-            s2c_thr = ProxyThread(q_, conn_tcp, conn_proxy)
+            c2s_thr = ProxyThread(q_, pa, conn_proxy, ta, conn_tcp)
+            s2c_thr = ProxyThread(q_, ta, conn_tcp, pa, conn_proxy)
             c2s_thr.setDaemon(True)
             s2c_thr.setDaemon(True)
             c2s_thr.start()
