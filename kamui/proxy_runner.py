@@ -57,10 +57,10 @@ def _check_proxy_address(address):
         raise ValueError('Invalid proxy-address: ' + str(address))
 
 
-class ProxyThread(Thread):
+class _SimplexChannelThread(Thread):
 
     def __init__(self, q_, addr_in, conn_in, addr_out, conn_out, *args, **kwargs):
-        super(ProxyThread, self).__init__(*args, **kwargs)
+        super(_SimplexChannelThread, self).__init__(*args, **kwargs)
         self._q = q_  # type: Queue
         self._addr_in = addr_in
         self._conn_in = conn_in
@@ -68,7 +68,7 @@ class ProxyThread(Thread):
         self._conn_out = conn_out
 
     @staticmethod
-    def long_op(func, *args, **kwargs):
+    def _long_op(func, *args, **kwargs):
         try:
             return func(*args, **kwargs)
         except BlockingOperation as ex:
@@ -84,21 +84,21 @@ class ProxyThread(Thread):
     def run(self):
         try:
             while True:
-                data = self.long_op(self._conn_in.recv, 4096)
+                data = self._long_op(self._conn_in.recv, 4096)
                 if not data:
                     # read EOF
                     LOG.debug('%s -> %s: EOF' % (self._addr_in, self._addr_out))
-                    self.long_op(self._conn_out.shutdown, SHUT_WR)
+                    self._long_op(self._conn_out.shutdown, SHUT_WR)
                     break
-                self.long_op(self._conn_out.sendall, data)
+                self._long_op(self._conn_out.sendall, data)
         except ConnectionAbortedError:
             LOG.error('connection aborted by accident.')
         finally:
             self._q.put(1, block=False)
             if self._q.full():
-                LOG.debug('tunnel [%s -- %s] closed' % (self._addr_in, self._addr_out))
-                self.long_op(self._conn_out.close)
-                self.long_op(self._conn_in.close)
+                LOG.debug('channel [%s -- %s] closed' % (self._addr_in, self._addr_out))
+                self._long_op(self._conn_out.close)
+                self._long_op(self._conn_in.close)
 
 
 class ClientWorkspaceProcess(Process):
@@ -169,8 +169,8 @@ class ClientWorkspaceProcess(Process):
                 LOG.info('received a tcp connection on %s, forwarding to proxy %s' % (la, pa))
                 conn_proxy = self._proxy_connect()
                 q_ = Queue(2)
-                c2s_thr = ProxyThread(q_, la, conn_tcp, pa, conn_proxy)
-                s2c_thr = ProxyThread(q_, pa, conn_proxy, la, conn_tcp)
+                c2s_thr = _SimplexChannelThread(q_, la, conn_tcp, pa, conn_proxy)
+                s2c_thr = _SimplexChannelThread(q_, pa, conn_proxy, la, conn_tcp)
                 c2s_thr.setDaemon(True)
                 s2c_thr.setDaemon(True)
                 c2s_thr.start()
@@ -237,8 +237,8 @@ class ServerWorkspaceProcess(Process):
             LOG.info('received a proxy connection on %s, forwarding to tcp %s' % (pa, ta))
             conn_tcp = create_connection(ta)
             q_ = Queue(2)
-            c2s_thr = ProxyThread(q_, pa, conn_proxy, ta, conn_tcp)
-            s2c_thr = ProxyThread(q_, ta, conn_tcp, pa, conn_proxy)
+            c2s_thr = _SimplexChannelThread(q_, pa, conn_proxy, ta, conn_tcp)
+            s2c_thr = _SimplexChannelThread(q_, ta, conn_tcp, pa, conn_proxy)
             c2s_thr.setDaemon(True)
             s2c_thr.setDaemon(True)
             c2s_thr.start()
