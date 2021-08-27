@@ -6,8 +6,10 @@ from os.path import realpath
 from queue import Queue
 from socket import (
     create_connection,
-    create_server,
+    socket,
+    AF_INET,
     SHUT_WR,
+    SOCK_STREAM,
 )
 from threading import (
     Thread,
@@ -163,7 +165,10 @@ class ClientWorkspaceProcess(Process):
         la = self._config.listen_address
         pa = self._config.proxy_address
 
-        with create_server(la) as in_tcp:
+        in_tcp = socket(AF_INET, SOCK_STREAM)
+        in_tcp.bind(la)
+        in_tcp.listen(128)
+        try:
             while True:
                 conn_tcp, addr_tcp = in_tcp.accept()
                 LOG.info('received a tcp connection on %s, forwarding to proxy %s' % (la, pa))
@@ -175,6 +180,8 @@ class ClientWorkspaceProcess(Process):
                 s2c_thr.setDaemon(True)
                 c2s_thr.start()
                 s2c_thr.start()
+        finally:
+            in_tcp.close()
 
 
 class ServerWorkspaceProcess(Process):
